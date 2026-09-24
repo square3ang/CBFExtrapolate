@@ -36,6 +36,13 @@
 			"type": "bool",
 			"default": false
 		},
+		"render-lead": {
+			"name": "Render Lead",
+			"description": "How far the rendered sample leads the engine, ordered from no added lead to the most.\n\nLead is how far ahead of the game's simulation the player is drawn. More lead reacts sooner but extrapolation will be less accurate.\n\n<cy>none</c>: no added lead. Theoretically the most accurate, but at refresh rates that aren't factors or multiples of 240, the fake follows the engine's step pattern and microstutters.\n\n<cy>adaptive</c>: leads only by the recently seen negative remainder. Minimal lead without the stutter. (Experimental)\n\n<cy>constant</c>: a fixed half engine step of lead. Smoothest setting, but might have inconsistent input delay. (Default)\n\n<cy>cpu-smooth</c>: pre-2.4.0 behavior with the lag low-pass filtered, so the lead moves in microseconds per frame. Almost as responsive as cpu but compensates for its lead jitter. Might hitch occasionally and break with extreme speedhack values. (Experimental)\n\n<cy>cpu</c>: raw wall time since the last executed step, clamped to one engine step. The most responsive, but the lead jitters per frame so it judders, and it can show the past (pre-2.4.0).",
+			"type": "string",
+			"default": "constant",
+			"one-of": ["none", "adaptive", "constant", "cpu-smooth", "cpu"]
+		},
 		"wine-cbf-workaround": {
 			"name": "Wine CBF Workaround",
 			"description": "Read the input CBF's Linux helper captures (its Wine workaround path) so early clicks show in the frame being drawn. Requires Click Between Frames v1.5.0.",
@@ -43,6 +50,12 @@
 			"default": true,
 			"enable-if": "saved:cbf-1-5-0",
 			"enable-if-description": "Requires Click Between Frames v1.5.0"
+		},
+		"lead-log": {
+			"name": "Lead Log",
+			"description": "Log the render lead every 5 seconds (avg/min/max and the average fps) so the modes can be compared in-game.",
+			"type": "bool",
+			"default": false
 		}
 	}
 }

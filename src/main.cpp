@@ -21,11 +21,58 @@ using namespace geode::prelude;
 
 static bool g_softToggle = false;
 static bool g_extrapolating = false;
+static bool g_leadLog = false;
+
+enum class RenderLead { None, Adaptive, Constant, CpuSmooth, Cpu };
+static RenderLead g_renderLead = RenderLead::Constant;
+
+static RenderLead renderLeadFromString(std::string const &value) {
+  if (value == "none") {
+    return RenderLead::None;
+  }
+  if (value == "constant") {
+    return RenderLead::Constant;
+  }
+  if (value == "cpu-smooth") {
+    return RenderLead::CpuSmooth;
+  }
+  if (value == "cpu") {
+    return RenderLead::Cpu;
+  }
+  return RenderLead::Constant;
+}
+
+// for logging
+static const char *renderLeadName(RenderLead mode) {
+  switch (mode) {
+  case RenderLead::None:
+    return "none";
+  case RenderLead::Adaptive:
+    return "adaptive";
+  case RenderLead::Constant:
+    return "constant";
+  case RenderLead::CpuSmooth:
+    return "cpu-smooth";
+  case RenderLead::Cpu:
+    return "cpu";
+  }
+  return "?";
+}
 
 $on_mod(Loaded) {
   g_softToggle = Mod::get()->getSettingValue<bool>("soft-toggle");
   listenForSettingChanges<bool>("soft-toggle",
                                 [](bool value) { g_softToggle = value; });
+
+  g_renderLead = renderLeadFromString(
+      Mod::get()->getSettingValue<std::string>("render-lead"));
+  listenForSettingChanges<std::string>("render-lead", [](std::string value) {
+    g_renderLead = renderLeadFromString(value);
+  });
+
+  g_leadLog = Mod::get()->getSettingValue<bool>("lead-log");
+  listenForSettingChanges<bool>("lead-log",
+                                [](bool value) { g_leadLog = value; });
 
   earlyInputSetup();
 }
@@ -400,6 +447,24 @@ class $modify(MyBGL, GJBaseGameLayer) {
     bool m_enableSolidCollisions = true;
     double m_teleportYOffset = 0.0;
 
+    double m_lastVisitTime = 0.0;
+
+    // adaptive recent worst negative remainder
+    double m_minRemainder = 0.0;
+    bool m_minRemainderInit = false;
+
+    // cpu-smooth low-passed clock lag
+    double m_lagSlow = 0.0;
+    bool m_lagSlowInit = false;
+
+    // lead log
+    double m_leadWindowStart = 0.0;
+    double m_leadSum = 0.0;
+    double m_leadMin = 0.0;
+    double m_leadMax = 0.0;
+    double m_leadDtSum = 0.0;
+    int m_leadCount = 0;
+
     ~Fields() {
       cleanUpFakePlayer(m_fakePlayer1);
       cleanUpFakePlayer(m_fakePlayer2);
@@ -656,26 +721,160 @@ class $modify(MyBGL, GJBaseGameLayer) {
     float xSign = (hasObj && m_objectLayer->getScaleX() < 0) ? -1 : 1;
     bool dead = m_playerDied;
 
-    // How far the render sample sits ahead of the last executed physics step, in game seconds. Long explaination below :
-    // getModifiedDelta() steps the game in whole quanta of min(timeWarp, 1) / 240 seconds and carries the un-simulated remainder in m_extraDelta, so after this frame's steps the simulated time is `m_extraDelta` behind the game clock (the clock only advances when the next frame's dt arrives, so it still reads the start of this frame). Stepping by that remainder alone would land exactly on the game clock, the start of this frame (and would go negative whenever the engine rounded up), so half a quantum (1/480 sec at normal speed) is added. The sample then advances by exactly one display interval per frame no matter how many steps ran, which is what removes the stutter at refresh rates that aren't factors or multiples of 240.
+    double visitAdvance = -1.0; // dont touch this
     auto renderAdvanceSeconds = [&]() -> double {
-      double timeWarp = std::isfinite(m_gameState.m_timeWarp) ? m_gameState.m_timeWarp : 1.0;
+      if (visitAdvance >= 0.0) {
+        return visitAdvance; // exit early when computed once, this lambda got
+                             // called 3 times in a single frame (p1, p2,
+                             // camera), we dont want adaptive and cpu-smooth
+                             // filter be done 3 times in a frame.
+      }
+      // our own wall timer delta so speedhack can't skew the
+      // measurement or the logged fps.
+      double now = getCurrentTimestamp();
+      double wallDt = m_fields->m_lastVisitTime > 0.0
+                          ? now - m_fields->m_lastVisitTime
+                          : 1.0 / 60.0;
+      if (!std::isfinite(wallDt) || wallDt <= 0.0) {
+        wallDt = 1.0 / 60.0;
+      }
+      if (wallDt > 0.25) {
+        wallDt = 0.25;
+      }
+      m_fields->m_lastVisitTime = now;
+      double timeWarp =
+          std::isfinite(m_gameState.m_timeWarp) ? m_gameState.m_timeWarp : 1.0;
       if (timeWarp <= 0.0) {
         timeWarp = 1.0;
       }
       double quantum = std::min(timeWarp, 1.0) / 240.0;
-      double advance = m_extraDelta + 0.5 * quantum;
-      if (!std::isfinite(advance) || advance < 0.0) {
-        advance = 0.0;
-      } else if (advance > quantum) {
-        advance = quantum;
+      auto clampedAdvance = [&](double advance) -> double {
+        if (!std::isfinite(advance) || advance < 0.0) {
+          return 0.0;
+        }
+        if (advance > quantum) {
+          return quantum;
+        }
+        return advance;
+      };
+
+      // effective game/wall rate, a speedhack or timewarp scales it
+      double scale = m_gameState.m_timeWarp;
+      if (m_fields->p1.prevTime > 0.0001 &&
+          m_fields->p1.lastTime > m_fields->p1.prevTime &&
+          m_fields->p1.lastDt > 0.0001f) {
+        double diff = m_fields->p1.lastTime - m_fields->p1.prevTime;
+        if (diff > 0.001) {
+          scale = (m_fields->p1.lastDt / 60.0f) / diff;
+        }
       }
-      return advance;
+      if (!std::isfinite(scale) || scale <= 0.0) {
+        scale = 1.0;
+      }
+
+      switch (g_renderLead) {
+      // this would sometimes add a lead because the engine rounds up
+      case RenderLead::None:
+        visitAdvance = clampedAdvance(m_extraDelta);
+        break;
+
+      case RenderLead::Adaptive: {
+        // bias half life, might need to finetune this
+        constexpr double kBiasHalfLife = 0.2;
+        if (!m_fields->m_minRemainderInit) {
+          m_fields->m_minRemainderInit = true;
+          m_fields->m_minRemainder = 0.0;
+        }
+        double decay = 0.0;
+        if (kBiasHalfLife > 0.0) {
+          decay = std::exp2(-wallDt / kBiasHalfLife);
+        }
+        m_fields->m_minRemainder =
+            std::min(m_fields->m_minRemainder * decay, m_extraDelta);
+        double bias =
+            std::max(0.0, std::min(-m_fields->m_minRemainder, quantum));
+        visitAdvance = clampedAdvance(m_extraDelta + bias);
+        break;
+      }
+
+      case RenderLead::Constant:
+        visitAdvance = clampedAdvance(m_extraDelta + 0.5 * quantum);
+        break;
+
+      // 2.3.6 behavior with the lag low-passed, so the lead moves in
+      // microseconds per frame instead of jumping with the wall measurement.
+      // needs more testing, it might not work on higher fps.
+      case RenderLead::CpuSmooth: {
+        constexpr double kLagHalfLife = 1.0;
+        double lagInst = (now - m_fields->p1.lastTime) * scale - m_extraDelta;
+        if (!std::isfinite(lagInst)) {
+          lagInst = 0.0;
+        }
+        if (!m_fields->m_lagSlowInit) {
+          m_fields->m_lagSlowInit = true;
+          m_fields->m_lagSlow = lagInst;
+        }
+        m_fields->m_lagSlow += (lagInst - m_fields->m_lagSlow) *
+                               (1.0 - std::exp2(-wallDt / kLagHalfLife));
+        visitAdvance =
+            clampedAdvance(m_extraDelta + std::max(0.0, m_fields->m_lagSlow));
+        break;
+      }
+
+      // 2.3.6 stepping behavior
+      case RenderLead::Cpu:
+        visitAdvance = clampedAdvance((now - m_fields->p1.lastTime) * scale);
+        break;
+      }
+
+      if (g_leadLog) {
+        // lead against the engine's clock, so the engine running ahead shows
+        // up too. this goes to negative on cpu mode sometimes lol
+        double lead = visitAdvance - m_extraDelta;
+        if (m_fields->m_leadWindowStart == 0.0) {
+          m_fields->m_leadWindowStart = now;
+        }
+        if (m_fields->m_leadCount == 0) {
+          m_fields->m_leadMin = lead;
+          m_fields->m_leadMax = lead;
+        } else {
+          m_fields->m_leadMin = std::min(m_fields->m_leadMin, lead);
+          m_fields->m_leadMax = std::max(m_fields->m_leadMax, lead);
+        }
+        m_fields->m_leadSum += lead;
+        m_fields->m_leadDtSum += wallDt;
+        m_fields->m_leadCount++;
+        if (now - m_fields->m_leadWindowStart >= 5.0) {
+          double fps = m_fields->m_leadDtSum > 0.0
+                           ? m_fields->m_leadCount / m_fields->m_leadDtSum
+                           : 0.0;
+          log::info("[extrapolate] lead ({}) avg {:.2f} ms, min {:.2f} ms, max "
+                    "{:.2f} ms over {:.1f} s ({} samples, {:.0f} fps)",
+                    renderLeadName(g_renderLead),
+                    m_fields->m_leadSum / m_fields->m_leadCount * 1000.0,
+                    m_fields->m_leadMin * 1000.0, m_fields->m_leadMax * 1000.0,
+                    now - m_fields->m_leadWindowStart, m_fields->m_leadCount,
+                    fps);
+          m_fields->m_leadWindowStart = now;
+          m_fields->m_leadSum = 0.0;
+          m_fields->m_leadDtSum = 0.0;
+          m_fields->m_leadCount = 0;
+        }
+      } else {
+        m_fields->m_leadWindowStart = 0.0;
+        m_fields->m_leadSum = 0.0;
+        m_fields->m_leadDtSum = 0.0;
+        m_fields->m_leadCount = 0;
+      }
+
+      return visitAdvance;
     };
 
-    // length of one engine step, in the same units as renderAdvanceSeconds() / timeScale.
+    // length of one engine step, in the same units as renderAdvanceSeconds() /
+    // timeScale.
     auto renderStepSeconds = [&](double timeScale) -> double {
-      double timeWarp = std::isfinite(m_gameState.m_timeWarp) ? m_gameState.m_timeWarp : 1.0;
+      double timeWarp =
+          std::isfinite(m_gameState.m_timeWarp) ? m_gameState.m_timeWarp : 1.0;
       if (timeWarp <= 0.0) {
         timeWarp = 1.0;
       }
@@ -714,7 +913,8 @@ class $modify(MyBGL, GJBaseGameLayer) {
           double targetTime = state.lastTime + dtSeconds;
           state.isDead = false;
 
-          // one step right before the game render, exactly to the segment that ends at the next input (or at the render sample)
+          // one step right before the game render, exactly to the segment that
+          // ends at the next input (or at the render sample)
           auto updatePlayerSubstepped = [&](double dtFrames) {
             if (dtFrames <= 0.0) {
               return;
@@ -828,10 +1028,9 @@ class $modify(MyBGL, GJBaseGameLayer) {
           if (hasCBF) {
             bool isTwoPlayer =
                 m_levelSettings && m_levelSettings->m_twoPlayerMode;
-            if (!collectEarlyClicks(pendingClicks, tCurrentClamped,
-                                    state.lastTime, dtSeconds,
-                                    renderStepSeconds(timeScale), false,
-                                    isTwoPlayer)) {
+            if (!collectEarlyClicks(
+                    pendingClicks, tCurrentClamped, state.lastTime, dtSeconds,
+                    renderStepSeconds(timeScale), false, isTwoPlayer)) {
               for (const auto &cmd : m_queuedButtons) {
                 bool isTarget = !cmd.m_isPlayer2 || !isTwoPlayer;
                 if (isTarget && cmd.m_timestamp > state.lastTime &&
@@ -887,10 +1086,9 @@ class $modify(MyBGL, GJBaseGameLayer) {
           if (hasCBF) {
             bool isTwoPlayer =
                 m_levelSettings && m_levelSettings->m_twoPlayerMode;
-            if (!collectEarlyClicks(pendingClicks, tCurrentClamped,
-                                    state.lastTime, dtSeconds,
-                                    renderStepSeconds(timeScale), true,
-                                    isTwoPlayer)) {
+            if (!collectEarlyClicks(
+                    pendingClicks, tCurrentClamped, state.lastTime, dtSeconds,
+                    renderStepSeconds(timeScale), true, isTwoPlayer)) {
               for (const auto &cmd : m_queuedButtons) {
                 bool isTarget = cmd.m_isPlayer2 || !isTwoPlayer;
                 if (isTarget && cmd.m_timestamp > state.lastTime &&
@@ -997,12 +1195,10 @@ class $modify(MyBGL, GJBaseGameLayer) {
     if (hasP1 && simulatedP1) {
       m_player1->CCNode::setPosition(origP1);
       m_player1->m_position = origP1Rob;
-
     }
     if (hasP2 && simulatedP2) {
       m_player2->CCNode::setPosition(origP2);
       m_player2->m_position = origP2Rob;
-
     }
 
     m_playerDied = origPlayerDied;
